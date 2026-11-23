@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
+from nanochat.dca import GRN, DCAStack, dca_slots
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -33,10 +34,18 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # Optional loop: repeat n_middle_count times the unique middle blocks
+    # [loop_middle_start, loop_middle_end). Input and output blocks run once.
+    loop_middle_count: int = 1
+    loop_middle_start: int = 0
+    loop_middle_end: int = 0
+    num_experts: int = 1
+    moe_aux_loss_coef: float = 0.01
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    dca_k: int = 0
 
 
 def norm(x):
@@ -81,19 +90,19 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        B, T, C = x.size()
+    def forward(self, q_in, k_in, v_in, ve, cos_sin, window_size, kv_cache, cache_layer_idx=None):
+        B, T, C = q_in.size()
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        q = self.c_q(q_in).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(k_in).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(v_in).view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            gate = 3 * torch.sigmoid(self.ve_gate(v_in[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
@@ -110,7 +119,8 @@ class CausalSelfAttention(nn.Module):
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            cache_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
+            k_cache, v_cache = kv_cache.get_layer_cache(cache_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
@@ -118,10 +128,6 @@ class CausalSelfAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
-
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -141,16 +147,78 @@ class MLP(nn.Module):
         return x
 
 
+class MoEMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.router = Linear(config.n_embd, self.num_experts, bias=False)
+        self.c_fc = nn.ModuleList([
+            Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            for _ in range(self.num_experts)
+        ])
+        self.c_proj = nn.ModuleList([
+            Linear(4 * config.n_embd, config.n_embd, bias=False)
+            for _ in range(self.num_experts)
+        ])
+
+    def forward(self, x):
+        B, T, C = x.shape
+        flat_x = x.reshape(-1, C)
+        router_logits = self.router(flat_x)
+        router_probs = torch.softmax(router_logits.float(), dim=-1)
+        expert_idx = router_probs.argmax(dim=-1)
+
+        flat_out = torch.zeros_like(flat_x)
+        for expert in range(self.num_experts):
+            mask = expert_idx == expert
+            if mask.any():
+                expert_x = flat_x[mask]
+                expert_x = self.c_fc[expert](expert_x)
+                expert_x = F.relu(expert_x).square()
+                flat_out[mask] = self.c_proj[expert](expert_x)
+
+        expert_mask = F.one_hot(expert_idx, num_classes=self.num_experts).float()
+        expert_fraction = expert_mask.mean(dim=0)
+        expert_probability = router_probs.mean(dim=0)
+        aux_loss = self.num_experts * torch.sum(expert_fraction * expert_probability)
+        return flat_out.reshape(B, T, C), aux_loss
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MoEMLP(config) if config.num_experts > 1 else MLP(config)
+        if config.dca_k > 0:
+            self.grn_qkv = GRN(3, dca_slots(2 * layer_idx, config.dca_k), config.n_embd)
+            self.grn_mlp = GRN(1, dca_slots(2 * layer_idx + 1, config.dca_k), config.n_embd)
+        else:
+            self.grn_qkv = None
+            self.grn_mlp = None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cache_layer_idx=None, stack=None, i=0):
+        if stack is None:
+            x = x + self.attn(norm(x), norm(x), norm(x), ve, cos_sin, window_size, kv_cache, cache_layer_idx)
+            mlp_output = self.mlp(norm(x))
+            if isinstance(self.mlp, MoEMLP):
+                mlp_output, aux_loss = mlp_output
+                x = x + mlp_output
+                return x, aux_loss
+            x = x + mlp_output
+            return x, x.new_zeros(())
+
+        qkv = self.grn_qkv(stack.tensors())
+        q_in, k_in, v_in = qkv.unbind(2)
+        attn_output = self.attn(norm(q_in), norm(k_in), norm(v_in), ve, cos_sin, window_size, kv_cache, cache_layer_idx)
+        stack.push(attn_output)
+        m_in = self.grn_mlp(stack.tensors())[:, :, 0]
+        mlp_output = self.mlp(norm(m_in))
+        if isinstance(self.mlp, MoEMLP):
+            mlp_output, aux_loss = mlp_output
+            stack.push(mlp_output)
+            return None, aux_loss
+        stack.push(mlp_output)
+        return None, x.new_zeros(())
 
 
 class GPT(nn.Module):
@@ -162,6 +230,21 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        if config.loop_middle_count < 1:
+            raise ValueError("loop_middle_count must be >= 1")
+        if config.dca_k > 0 and config.loop_middle_count != 1:
+            raise ValueError("DCA currently requires loop_middle_count=1")
+        if config.loop_middle_start == 0 and config.loop_middle_end == 0:
+            if config.loop_middle_count > 1:
+                raise ValueError("loop_middle_start and loop_middle_end are required when loop_middle_count > 1")
+            config.loop_middle_start = 0
+            config.loop_middle_end = config.n_layer
+        if not (0 <= config.loop_middle_start < config.loop_middle_end <= config.n_layer):
+            raise ValueError("Loop middle range must be within [0, n_layer]")
+        if config.loop_middle_count > 1 and config.loop_middle_start == 0 and config.loop_middle_end == config.n_layer:
+            raise ValueError("A loop middle range must leave input and/or output blocks")
+        middle_count = config.loop_middle_end - config.loop_middle_start
+        scalar_count = config.n_layer + (config.loop_middle_count - 1) * middle_count
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -172,15 +255,16 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        self.final_grn = GRN(1, dca_slots(2 * config.n_layer, config.dca_k), config.n_embd) if config.dca_k > 0 else None
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
         # Separate parameters so they can have different optimizer treatment
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        self.resid_lambdas = nn.Parameter(torch.ones(scalar_count))   # fake init, real init in init_weights()
+        self.x0_lambdas = nn.Parameter(torch.zeros(scalar_count))     # fake init, real init in init_weights()
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
         self.smear_gate = Linear(24, 1, bias=False)
         self.smear_lambda = nn.Parameter(torch.zeros(1))
@@ -228,17 +312,43 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.grn_qkv is not None:
+                block.grn_qkv.reset_parameters()
+                block.grn_mlp.reset_parameters()
+            if isinstance(block.mlp, MoEMLP):
+                torch.nn.init.uniform_(block.mlp.router.weight, -s, s)
+                for expert in range(block.mlp.num_experts):
+                    torch.nn.init.uniform_(block.mlp.c_fc[expert].weight, -s * 0.4, s * 0.4)
+                    torch.nn.init.zeros_(block.mlp.c_proj[expert].weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        if self.final_grn is not None:
+            self.final_grn.reset_parameters()
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
+        middle_count = max(0, self.config.loop_middle_end - self.config.loop_middle_start)
+        scalar_count = n_layer + (self.config.loop_middle_count - 1) * middle_count
         for i in range(n_layer):
             self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+        if scalar_count > n_layer:
+            middle_slice = slice(self.config.loop_middle_start, self.config.loop_middle_end)
+            for loop_idx in range(1, self.config.loop_middle_count):
+                scalar_offset = n_layer + (loop_idx - 1) * middle_count
+                for local_idx, model_idx in enumerate(range(middle_slice.start, middle_slice.stop)):
+                    resid_idx = scalar_offset + local_idx
+                    self.resid_lambdas.data[resid_idx] = 1.15 - (0.10 * model_idx / max(n_layer - 1, 1))
+                    self.x0_lambdas.data[resid_idx] = 0.20 - (0.15 * model_idx / max(n_layer - 1, 1))
+
+        if self.config.dca_k > 0:
+            torch.nn.init.ones_(self.resid_lambdas)
+            torch.nn.init.zeros_(self.x0_lambdas)
 
         # Smear/backout scalars and smear gate must be explicitly initialized 
         torch.nn.init.zeros_(self.smear_lambda)
@@ -331,11 +441,24 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
+        loop_count = self.config.loop_middle_count
+        middle_start = self.config.loop_middle_start
+        middle_end = self.config.loop_middle_end
+        for i, window_size in enumerate(self.window_sizes):
+            window = window_size[0]
             effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+            repetitions = loop_count if middle_start <= i < middle_end else 1
+            attn_flops += 12 * h * q * effective_seq * repetitions
+        middle_start = self.config.loop_middle_start
+        middle_end = self.config.loop_middle_end
+        loop_count = self.config.loop_middle_count
+        middle_matmul_params = sum(
+            sum(p.numel() for p in block.parameters())
+            for block in list(self.transformer.h)[middle_start:middle_end]
+        )
+        num_flops_per_token = 6 * self.num_matmul_params()
+        num_flops_per_token += 6 * middle_matmul_params * (loop_count - 1)
+        num_flops_per_token += attn_flops
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -346,6 +469,7 @@ class GPT(nn.Module):
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        matmul_params += sum(p.numel() for n, p in self.named_parameters() if "grn" in n and n.endswith(".w"))
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
@@ -355,8 +479,20 @@ class GPT(nn.Module):
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
-        decode_flops = 2 * self.num_matmul_params() + attn_flops
+        middle_start = self.config.loop_middle_start
+        middle_end = self.config.loop_middle_end
+        loop_count = self.config.loop_middle_count
+        attn_flops = sum(
+            4 * h * q * min(context_len, window) * (loop_count if middle_start <= i < middle_end else 1)
+            for i, (window, _) in enumerate(self.window_sizes)
+        )
+        middle_matmul_params = sum(
+            sum(p.numel() for p in block.parameters())
+            for block in list(self.transformer.h)[middle_start:middle_end]
+        )
+        decode_flops = 2 * self.num_matmul_params()
+        decode_flops += 2 * middle_matmul_params * (loop_count - 1)
+        decode_flops += attn_flops
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
@@ -364,18 +500,30 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = 0
-        for window, _ in self.window_sizes:
+        middle_start = self.config.loop_middle_start
+        middle_end = self.config.loop_middle_end
+        loop_count = self.config.loop_middle_count
+        for i, (window, _) in enumerate(self.window_sizes):
             w = min(window, num_tokens)
             attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
-            attn_flops += 4 * h * q * attended_tokens
-        prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
+            repetitions = loop_count if middle_start <= i < middle_end else 1
+            attn_flops += 4 * h * q * attended_tokens * repetitions
+        middle_matmul_params = sum(
+            sum(p.numel() for p in block.parameters())
+            for block in list(self.transformer.h)[middle_start:middle_end]
+        )
+        matmul_flops = 2 * self.num_matmul_params() * num_tokens
+        matmul_flops += 2 * middle_matmul_params * (loop_count - 1) * num_tokens
+        prefill_flops = matmul_flops + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
         """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        middle_count = self.config.loop_middle_end - self.config.loop_middle_start
+        execution_depth = self.config.n_layer + (self.config.loop_middle_count - 1) * middle_count
+        return execution_depth * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
         """Bytes of KV cache *read* by one decode step at a given context length, per row.
@@ -383,8 +531,12 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
-        for window, _ in self.window_sizes:
-            total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
+        middle_start = self.config.loop_middle_start
+        middle_end = self.config.loop_middle_end
+        loop_count = self.config.loop_middle_count
+        for i, (window, _) in enumerate(self.window_sizes):
+            repetitions = loop_count if middle_start <= i < middle_end else 1
+            total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window) * repetitions
         return total
 
     def num_scaling_params(self):
@@ -403,31 +555,35 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        transformer_matrices = sum(p.numel() for n, p in self.transformer.h.named_parameters() if "grn" not in n)
+        dca_params = sum(p.numel() for n, p in self.named_parameters() if "grn" in n)
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total += dca_params
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'dca_params': dca_params,
             'scalars': scalars,
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, grn_lr=0.005):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [p for n, p in self.transformer.h.named_parameters() if "grn" not in n]
+        grn_params = [p for n, p in self.named_parameters() if "grn" in n]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(grn_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -443,6 +599,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if grn_params:
+            param_groups.append(dict(
+                kind='adamw', params=grn_params, lr=grn_lr * dmodel_lr_scale,
+                betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0,
+            ))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -496,16 +657,58 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        moe_aux_loss = x.new_zeros(())
+        middle_start = self.config.loop_middle_start
+        middle_end = self.config.loop_middle_end
+        middle_count = middle_end - middle_start
+        stack = DCAStack(x, self.config.dca_k) if self.config.dca_k > 0 else None
+
+        def run_block(i, scalar_idx, loop_idx=None, local_idx=None):
+            nonlocal x, x_backout, moe_aux_loss
+            if self.config.dca_k == 0:
+                x = self.resid_lambdas[scalar_idx] * x + self.x0_lambdas[scalar_idx] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
+            unique_i = i
+            if loop_idx is not None:
+                cache_idx = middle_start + loop_idx * middle_count + local_idx
+            elif i >= middle_end:
+                cache_idx = middle_start + self.config.loop_middle_count * middle_count + i - middle_end
+            else:
+                cache_idx = i
+            if self.config.dca_k > 0:
+                block_output = self.transformer.h[unique_i](x, ve, cos_sin, self.window_sizes[i], kv_cache, cache_idx, stack=stack)
+                _, block_aux_loss = block_output
+            else:
+                block_output = self.transformer.h[unique_i](x, ve, cos_sin, self.window_sizes[i], kv_cache, cache_idx)
+                x, block_aux_loss = block_output
+            moe_aux_loss = moe_aux_loss + block_aux_loss
+            if loop_idx is None and i == backout_layer:
                 x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+            return x
+
+        for i in range(0, middle_start):
+            run_block(i, i)
+
+        for loop_idx in range(self.config.loop_middle_count):
+            for local_idx, i in enumerate(range(middle_start, middle_end)):
+                scalar_offset = n_layer if loop_idx > 0 else 0
+                scalar_idx = i if loop_idx == 0 else scalar_offset + (loop_idx - 1) * middle_count + local_idx
+                run_block(i, scalar_idx, loop_idx, local_idx)
+                if loop_idx == self.config.loop_middle_count - 1 and i == backout_layer:
+                    x_backout = x
+
+        for i in range(middle_end, n_layer):
+            run_block(i, i)
+
+        if kv_cache is not None:
+            kv_cache.advance(T)
+        if self.config.dca_k > 0:
+            x = norm(self.final_grn(stack.tensors())[:, :, 0])
+        else:
+            # Subtract mid-layer residual to remove low-level features before logit projection
+            if x_backout is not None:
+                x = x - self.backout_lambda.to(x.dtype) * x_backout
+            x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
@@ -518,6 +721,8 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if self.config.num_experts > 1:
+                loss = loss + self.config.moe_aux_loss_coef * moe_aux_loss
             return loss
         else:
             # inference: just return the logits directly

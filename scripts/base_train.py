@@ -52,6 +52,12 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--num-experts", type=int, default=1, help="number of routed MLP experts (1 disables MoE)")
+parser.add_argument("--moe-aux-loss-coef", type=float, default=0.01, help="load-balancing auxiliary loss coefficient")
+parser.add_argument("--loop-middle-count", type=int, default=1, help="number of times to execute the shared middle blocks")
+parser.add_argument("--loop-middle-start", type=int, default=0, help="first middle block index for looping (0 disables loop when end is 0)")
+parser.add_argument("--loop-middle-end", type=int, default=0, help="end middle block index for looping (0 disables loop)")
+parser.add_argument("--dca-k", type=int, default=0, help="enable DCA and keep the last k sublayer outputs in the depth stack (0 disables)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -64,6 +70,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--grn-lr", type=float, default=0.005, help="learning rate for DCA GRN parameters")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -137,6 +144,12 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        num_experts=args.num_experts,
+        moe_aux_loss_coef=args.moe_aux_loss_coef,
+        loop_middle_count=args.loop_middle_count,
+        loop_middle_start=args.loop_middle_start,
+        loop_middle_end=args.loop_middle_end,
+        dca_k=args.dca_k,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -310,6 +323,7 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
+    grn_lr=args.grn_lr * batch_lr_scale,
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
