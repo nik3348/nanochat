@@ -31,7 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-param-data-ratio", type=float, default=12)
     parser.add_argument("--device-batch-size", type=int, default=-1)
     parser.add_argument("--total-batch-size", type=int, default=-1)
-    parser.add_argument("--window-pattern", type=str, default="SSSL")
+    parser.add_argument("--window-pattern", type=str, default="L",
+                        help="attention window pattern: L=full context, S=quarter context")
     parser.add_argument("--run-prefix", type=str, default="dca-exp")
     parser.add_argument("--model-tag-prefix", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true",
