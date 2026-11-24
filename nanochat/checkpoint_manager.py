@@ -25,17 +25,24 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "loop_middle_count" not in model_config_kwargs:
+        model_config_kwargs["loop_middle_count"] = 1
+        model_config_kwargs["loop_middle_start"] = 0
+        model_config_kwargs["loop_middle_end"] = 0
+        log0(f"Patching missing loop config to baseline (no middle loop)")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
     n_layer = model_config.n_layer
+    middle_count = max(0, model_config.loop_middle_end - model_config.loop_middle_start)
+    scalar_count = n_layer + (model_config.loop_middle_count - 1) * middle_count
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
+        model_data["resid_lambdas"] = torch.ones(scalar_count)
         log0(f"Patching missing resid_lambdas in model data to 1.0")
     # x0_lambdas defaults to 0.0 (disabled)
     if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
+        model_data["x0_lambdas"] = torch.zeros(scalar_count)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):

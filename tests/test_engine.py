@@ -5,8 +5,35 @@ python -m pytest tests/test_engine.py -v
 """
 
 import torch
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.engine import KVCache, Engine
 from dataclasses import dataclass
+
+
+def test_looped_gpt_baseline_and_loop_shapes():
+    ids = torch.randint(0, 128, (2, 8))
+    for count in (1, 3):
+        config = GPTConfig(
+            sequence_len=32,
+            vocab_size=128,
+            n_layer=24,
+            n_head=4,
+            n_kv_head=4,
+            n_embd=128,
+            window_pattern="L",
+            loop_middle_count=count,
+            loop_middle_start=6 if count > 1 else 0,
+            loop_middle_end=18 if count > 1 else 0,
+        )
+        model = GPT(config)
+        model.init_weights()
+        model.eval()
+        execution_depth = config.n_layer + (count - 1) * max(0, 18 - 6)
+        cache = KVCache(2, 4, 32, 32, execution_depth, ids.device, torch.bfloat16)
+        with torch.no_grad():
+            logits = model(ids, kv_cache=cache)
+        assert logits.shape == (2, 8, 128)
+        assert cache.get_pos() == 8
 
 
 # -----------------------------------------------------------------------------
