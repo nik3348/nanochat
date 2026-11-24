@@ -1,12 +1,8 @@
-"""Run comparable baseline and DCA pretraining experiments.
+"""Run comparable baseline and DCA pretraining experiments locally.
 
 Examples:
   python -m scripts.run_dca_experiment --depth=12 --num-iterations=100
   python -m scripts.run_dca_experiment --depth=12 --dca-k 0 2 4 8
-  python -m scripts.run_dca_experiment --backend=hf --depth=12 --dca-k 0 4
-
-The HF mode launches one detached Job per experiment. It mounts the current
-repository into each Job and uses the A100 flavor by default.
 """
 
 from __future__ import annotations
@@ -19,9 +15,7 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run baseline/DCA pretraining comparisons")
-    parser.add_argument("--backend", choices=("local", "hf"), default="local",
-                        help="run experiments locally or launch Hugging Face Jobs")
+    parser = argparse.ArgumentParser(description="Run baseline/DCA pretraining comparisons locally")
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--dca-k", type=int, nargs="+", default=[0, 4],
                         help="DCA stack sizes; 0 is the baseline")
@@ -31,19 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-param-data-ratio", type=float, default=12)
     parser.add_argument("--device-batch-size", type=int, default=-1)
     parser.add_argument("--total-batch-size", type=int, default=-1)
-    parser.add_argument("--window-pattern", type=str, default="L",
-                        help="attention window pattern: L=full context, S=quarter context")
+    parser.add_argument("--window-pattern", type=str, default="SSSL")
     parser.add_argument("--run-prefix", type=str, default="dca-exp")
     parser.add_argument("--model-tag-prefix", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true",
-                        help="print commands without starting training or Jobs")
-
-    parser.add_argument("--hf-flavor", default="a100-large")
-    parser.add_argument("--hf-timeout", default="6h")
-    parser.add_argument("--skip-setup", action="store_true",
-                        help="HF mode: skip uv sync and tokenizer setup")
-    parser.add_argument("--setup-shards", type=int, default=8,
-                        help="number of dataset shards downloaded before HF training")
+                        help="print commands without starting training")
     return parser.parse_args()
 
 
@@ -116,64 +102,10 @@ def run_local(args: argparse.Namespace, k_values: list[int]) -> None:
         subprocess.run(command, cwd=root, env=env, check=True)
 
 
-def run_hf(args: argparse.Namespace, k_values: list[int]) -> None:
-    root = Path(__file__).resolve().parents[1]
-    setup = ""
-    if not args.skip_setup:
-        setup = (
-            "uv sync --extra gpu && "
-            f"uv run python -m nanochat.dataset -n {args.setup_shards} && "
-            "uv run python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768 && "
-        )
-
-    for k in k_values:
-        grn_lr = grn_lr_for(args, k_values, k)
-        name = experiment_name(args, k)
-        tag = model_tag(args, k)
-        training_args = " ".join(common_training_args(args, k, grn_lr))
-        shell_command = (
-            "cd /workspace && "
-            f"{setup}"
-            "OMP_NUM_THREADS=1 uv run python -m scripts.base_train "
-            f"{training_args} --run={name} --model-tag={tag}"
-        )
-        command = [
-            "hf",
-            "jobs",
-            "run",
-            "--flavor",
-            args.hf_flavor,
-            "--timeout",
-            args.hf_timeout,
-            "--detach",
-            "--name",
-            name,
-            "--volume",
-            f"{root}:/workspace:rw",
-        ]
-        if os.environ.get("HF_TOKEN"):
-            command += ["--secrets", "HF_TOKEN"]
-        if os.environ.get("WANDB_API_KEY"):
-            command += ["--secrets", "WANDB_API_KEY"]
-        command += [
-            "ghcr.io/astral-sh/uv:python3.12-bookworm-slim",
-            "bash",
-            "-lc",
-            shell_command,
-        ]
-        print_command(command)
-        if args.dry_run:
-            continue
-        subprocess.run(command, cwd=root, check=True)
-
-
 def main() -> None:
     args = parse_args()
     k_values = positive_k_values(args)
-    if args.backend == "hf":
-        run_hf(args, k_values)
-    else:
-        run_local(args, k_values)
+    run_local(args, k_values)
 
 
 if __name__ == "__main__":

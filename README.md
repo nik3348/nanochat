@@ -108,11 +108,8 @@ See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment
 To compare the DCA implementation against the residual baseline, use `scripts/run_dca_experiment.py`:
 
 ```bash
-# Local, sequential runs
+# Local, sequential runs (or use the Colab notebook below)
 uv run python -m scripts.run_dca_experiment --depth=12 --dca-k 0 4 --num-iterations=100
-
-# Launch baseline and DCA as detached Hugging Face Jobs
-uv run python -m scripts.run_dca_experiment --backend=hf --depth=12 --dca-k 0 4 --num-iterations=100
 ```
 
 The script gives each run a separate wandb name and model tag. Use `--grn-lrs` to sweep GRN learning rates; values can be paired one-to-one with `--dca-k`.
